@@ -58,9 +58,18 @@ void RemoteCallCleanup() { RemoteCall::removeNameSpace(kRemoteNamespace); }
         }
     }
 
-    mapd.mPixels         = std::move(pixels);
-    mapd.mDirtyForSave   = true;
-    mapd.mDirtyPixelData = true;
+    buffer_span<uint> pixelData{};
+    pixelData.mBegin = pixels.data();
+    pixelData.mEnd   = pixels.data() + pixels.size();
+
+    MapItemSavedData::ChunkBounds bounds{
+        .x0 = 0,
+        .z0 = 0,
+        .x1 = kMapSize,
+        .z1 = kMapSize,
+    };
+
+    mapd.setMapSection(pixelData, bounds);
     mapd.mLocked = true;
     mapd.setOrigin(
         Vec3(static_cast<float>(kFarAwayCoord), 0.F, static_cast<float>(kFarAwayCoord)),
