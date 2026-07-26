@@ -1,19 +1,22 @@
 #include "CustomMap.h"
 
+#include <fstream>
+#include <format>
+#include <string>
+#include <vector>
+
 #include <RemoteCallAPI.h>
 #include <ll/api/command/CommandHandle.h>
 #include <ll/api/command/CommandRegistrar.h>
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/mod/RegisterHelper.h>
 #include <ll/api/service/Bedrock.h>
-#include <mc/common/ActorUniqueID.h>
-#include <mc/nbt/Int64Tag.h>
+#include <mc/legacy/ActorUniqueID.h>
 #include <mc/server/ServerLevel.h>
 #include <mc/server/commands/CommandOrigin.h>
 #include <mc/server/commands/CommandOutput.h>
 #include <mc/server/commands/CommandPermissionLevel.h>
 #include <mc/world/actor/player/Player.h>
-#include <mc/world/item/MapItem.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/level/MapDataManager.h>
 #include <mc/world/level/dimension/VanillaDimensions.h>
@@ -25,41 +28,86 @@
 
 namespace custom_map {
 
+namespace {
+
+constexpr int kMapSize       = 128;
+constexpr int kMapPixelCount = kMapSize * kMapSize;
+constexpr int kFarAwayCoord  = 1000000000;
+constexpr auto kRemoteNamespace = "CustomMap";
+
+[[nodiscard]] auto tryGetLevelStorage() -> optional_ref<LevelStorage> {
+    return ll::service::getLevel().transform([](Level& level) -> LevelStorage& { return level.getLevelStorage(); });
+}
+
+[[nodiscard]] auto tryGetServerLevel() -> optional_ref<ServerLevel> {
+    return ll::service::getLevel().transform([](Level& level) -> ServerLevel& { return level.asServer(); });
+}
+
+void RemoteCallCleanup() { RemoteCall::removeNameSpace(kRemoteNamespace); }
+
+[[nodiscard]] bool MapSetPixels(MapItemSavedData& mapd, std::ifstream& ifs, bool alpha) {
+    std::vector<uint> pixels(kMapPixelCount);
+    if (!ifs.read(reinterpret_cast<char*>(pixels.data()), sizeof(uint) * pixels.size())) {
+        return false;
+    }
+
+    if (!alpha) {
+        auto alphaBit = 0xff << 24;
+        for (auto& pixel : pixels) {
+            pixel |= alphaBit;
+        }
+    }
+
+    mapd.mPixels         = std::move(pixels);
+    mapd.mDirtyForSave   = true;
+    mapd.mDirtyPixelData = true;
+    mapd.mLocked = true;
+    mapd.setOrigin(
+        Vec3(static_cast<float>(kFarAwayCoord), 0.F, static_cast<float>(kFarAwayCoord)),
+        0,
+        VanillaDimensions::Overworld(),
+        false,
+        false,
+        BlockPos(kFarAwayCoord, 0, kFarAwayCoord)
+    );
+    return true;
+}
+
+[[nodiscard]] long long AddMapFromFile(std::string const& filepath, bool alpha) {
+    std::ifstream ifs(filepath, std::ios::binary);
+    if (ifs.fail()) {
+        return -1LL;
+    }
+
+    auto level = tryGetServerLevel();
+    if (!level) {
+        logger.error("Failed to add map: server level is unavailable");
+        return -1LL;
+    }
+
+    auto  uid  = level->getNewUniqueID();
+    auto& mapd = level->_getMapDataManager().createMapSavedData(uid);
+    mapd.mScale = 4;
+
+    if (!MapSetPixels(mapd, ifs, alpha)) {
+        logger.error("Failed to add map from '{}': expected a 128x128 RGBA binary file", filepath);
+        return -1LL;
+    }
+
+    mapd.save(level->getLevelStorage());
+    return uid.rawID;
+}
+
+} // namespace
+
 struct MapParams {
     std::string filename;
     bool        alpha{false};
     bool        output{true};
 };
 
-void MapSetPixels(MapItemSavedData& mapd, std::ifstream& ifs, bool alpha) {
-
-    mapd.setPixel(0, 0, 0);
-    mapd.setPixel(0, 127, 127);
-
-    auto pixels = const_cast<unsigned int*>(mapd.getPixels().mBegin);
-    ifs.read(reinterpret_cast<char*>(pixels), sizeof(unsigned int) * 128 * 128);
-
-    if (!alpha) {
-        auto alpha_bit = 0xff << 24;
-        for (int i = 0; i < 128 * 128; i++) {
-            pixels[i] |= alpha_bit;
-        }
-    }
-
-    mapd.setLocked();
-    mapd.setOrigin(
-        Vec3(1e9, 0., 1e9),
-        0,
-        VanillaDimensions::Overworld(),
-        false,
-        false,
-        BlockPos((int)1e9, 0, (int)1e9)
-    );
-}
-
-
 void RegisterMapCommands() {
-    auto& command = ll::command::CommandRegistrar::getInstance()
+    auto& command = ll::command::CommandRegistrar::getInstance(false)
                         .getOrCreateCommand("map", "Customize the pixels on the map", CommandPermissionLevel::Any);
     command.overload<MapParams>()
         .required("filename")
@@ -74,9 +122,13 @@ void RegisterMapCommands() {
 
             auto* player = static_cast<Player*>(entity);
             auto* level  = origin.getLevel();
+            if (level == nullptr) {
+                output.error("Level is not available");
+                return;
+            }
 
             auto& item = player->getCarriedItem();
-            auto* data = item.getUserData();
+            auto* data = item.mUserData.get();
 
             if (data == nullptr) {
                 output.error("You must hold a filled map in your hand");
@@ -99,37 +151,50 @@ void RegisterMapCommands() {
                 }
             }
 
-            MapSetPixels(*mapd, ifs, param.alpha);
+            if (!MapSetPixels(*mapd, ifs, param.alpha)) {
+                output.error("Failed to read map pixel data. Expected a 128x128 RGBA binary file.");
+                return;
+            }
 
             mapd->save(level->getLevelStorage());
 
             if (param.output) {
                 output.success("Map data has been updated");
             } else {
-                output.success();
+                output.mSuccessCount++;
             }
         });
 }
 
 void RemoteCallExport() {
-    RemoteCall::exportAs("CustomMap", "delMap", [](long long uuid) {
+    RemoteCall::exportAs(kRemoteNamespace, "delMap", [](long long uuid) {
+        auto storage = tryGetLevelStorage();
+        if (!storage) {
+            logger.error("Failed to delete map: level storage is unavailable");
+            return false;
+        }
+
         std::string mapKey = std::format("map_{}", uuid);
-        auto&       db     = ll::service::getLevel()->getLevelStorage();
-        if (db.hasKey(mapKey, DBHelpers::Category::Item)) {
-            db.deleteData(mapKey, DBHelpers::Category::Item);
+        if (storage->hasKey(mapKey, DBHelpers::Category::Item)) {
+            storage->deleteData(mapKey, DBHelpers::Category::Item);
             return true;
         } else {
             return false;
         }
     });
 
-    RemoteCall::exportAs("CustomMap", "getMapList", []() {
+    RemoteCall::exportAs(kRemoteNamespace, "getMapList", []() {
         std::vector<long long> uuids;
-        auto&                  db = ll::service::getLevel()->getLevelStorage();
-        db.forEachKeyWithPrefix("map_", DBHelpers::Category::Item, [&](std::string_view key_left, std::string_view) {
+        auto storage = tryGetLevelStorage();
+        if (!storage) {
+            logger.error("Failed to enumerate maps: level storage is unavailable");
+            return uuids;
+        }
+
+        storage->forEachKeyWithPrefix("map_", DBHelpers::Category::Item, [&](std::string_view keyLeft, std::string_view) {
             try {
-                uuids.push_back(std::stoll(key_left.data()));
-            } catch (std::exception& e) {
+                uuids.push_back(std::stoll(std::string{keyLeft}));
+            } catch (std::exception const& e) {
                 logger.error(e.what());
                 return;
             }
@@ -137,29 +202,12 @@ void RemoteCallExport() {
         return uuids;
     });
 
-    auto addMap = [](const std::string& filepath, bool alpha) {
-        std::ifstream ifs(filepath, std::ios::binary);
-        if (ifs.fail()) {
-            return -1LL;
-        }
-
-        auto& level = static_cast<ServerLevel&>(ll::service::getLevel().get());
-        auto  uid   = level.getNewUniqueID();
-        auto& mapd  = level._getMapDataManager().createMapSavedData(uid);
-
-        mapd.setScale(4); // no parentMapId
-        MapSetPixels(mapd, ifs, alpha);
-
-        mapd.save(level.getLevelStorage());
-        return uid.rawID;
-    };
-
-    RemoteCall::exportAs("CustomMap", "addMap", [&addMap](const std::string& filepath) {
-        return addMap(filepath, true);
+    RemoteCall::exportAs(kRemoteNamespace, "addMap", [](std::string const& filepath) {
+        return AddMapFromFile(filepath, true);
     });
 
-    RemoteCall::exportAs("CustomMap", "addMapNoAlpha", [&addMap](const std::string& filepath) {
-        return addMap(filepath, false);
+    RemoteCall::exportAs(kRemoteNamespace, "addMapNoAlpha", [](std::string const& filepath) {
+        return AddMapFromFile(filepath, false);
     });
 }
 
@@ -171,16 +219,13 @@ CustomMap& CustomMap::getInstance() {
 bool CustomMap::load() {
     getSelf().getLogger().info("loading...");
 
-    // Code for loading the plugin goes here.
-    RemoteCallExport();
-
     return true;
 }
 
 bool CustomMap::enable() {
     getSelf().getLogger().info("enabling...");
 
-    // Code for enabling the plugin goes here.
+    RemoteCallExport();
     RegisterMapCommands();
 
     return true;
@@ -189,7 +234,15 @@ bool CustomMap::enable() {
 bool CustomMap::disable() {
     getSelf().getLogger().info("disabling...");
 
-    // Code for disabling the plugin goes here.
+    RemoteCallCleanup();
+
+    return true;
+}
+
+bool CustomMap::unload() {
+    getSelf().getLogger().info("unloading...");
+
+    RemoteCallCleanup();
 
     return true;
 }
